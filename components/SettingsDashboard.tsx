@@ -32,6 +32,7 @@ import {
   forceSyncNewsSources,
   getHomepageConfig,
   getVisitStats,
+  mapWithConcurrency,
   saveHomepageConfig,
   uploadBackgroundImage,
   type VisitStatsResponse,
@@ -158,7 +159,6 @@ export default function SettingsDashboard() {
   });
   const [bookmarkFormError, setBookmarkFormError] = useState<string | null>(null);
   const [isSubmittingBookmarkForm, setIsSubmittingBookmarkForm] = useState(false);
-  const [faviconLoading, setFaviconLoading] = useState(false);
   const [bulkRefreshStatus, setBulkRefreshStatus] = useState<
     'idle' | 'refreshing' | 'done' | 'error'
   >('idle');
@@ -460,7 +460,7 @@ export default function SettingsDashboard() {
   const handleBookmarkSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
-    if (isSubmittingBookmarkForm || faviconLoading) {
+    if (isSubmittingBookmarkForm) {
       return;
     }
 
@@ -486,17 +486,11 @@ export default function SettingsDashboard() {
 
     let finalIcon = iconInput;
     let finalIsCustomIcon = iconInput ? bookmarkForm.isCustomIcon : false;
+    // 无自定义图标时先保存（首字母兜底），图标改为后台异步补充，
+    // 避免等待 favicon 抓取（慢站点可能数秒）阻塞提交流程。
+    const needsAutoIcon = !finalIcon;
 
     try {
-      if (!finalIcon) {
-        setFaviconLoading(true);
-        const autoIcon = await fetchBookmarkFavicon(normalizedUrl);
-        if (autoIcon) {
-          finalIcon = autoIcon;
-        }
-        finalIsCustomIcon = false;
-      }
-
       const editing = Boolean(bookmarkForm.id);
       const id = editing ? bookmarkForm.id : createId('bookmark');
 
@@ -531,8 +525,40 @@ export default function SettingsDashboard() {
       });
 
       setBookmarkForm({ id: '', title: '', url: '', icon: '', isCustomIcon: false });
+
+      if (needsAutoIcon) {
+        void (async () => {
+          const fetchedIcon = await fetchBookmarkFavicon(normalizedUrl);
+          if (!fetchedIcon) {
+            return;
+          }
+
+          setConfig((prev) => {
+            const stillExists = prev.bookmarks.some((item) => item.id === id);
+            if (!stillExists) {
+              return prev;
+            }
+
+            const updated: HomepageConfig = {
+              ...prev,
+              bookmarks: prev.bookmarks.map((item) =>
+                item.id === id
+                  ? {
+                      ...item,
+                      icon: fetchedIcon,
+                      isCustomIcon: false,
+                    }
+                  : item
+              ),
+              updatedAt: new Date().toISOString(),
+            };
+
+            void persistConfig(updated);
+            return updated;
+          });
+        })();
+      }
     } finally {
-      setFaviconLoading(false);
       setIsSubmittingBookmarkForm(false);
     }
   };
@@ -572,13 +598,19 @@ export default function SettingsDashboard() {
     let successCount = 0;
     let failedCount = 0;
 
-    const nextBookmarks = await Promise.all(
-      config.bookmarks.map(async (bookmark) => {
+    // 分批并发（每批 4 个），避免全量并发占满浏览器同域连接；
+    // 手动刷新语义：force 绕过本地缓存，真正重新拉取图标。
+    const nextBookmarks = await mapWithConcurrency(
+      config.bookmarks,
+      4,
+      async (bookmark) => {
         if (!refreshableIds.has(bookmark.id)) {
           return bookmark;
         }
 
-        const fetchedIcon = await fetchBookmarkFavicon(bookmark.url);
+        const fetchedIcon = await fetchBookmarkFavicon(bookmark.url, {
+          force: true,
+        });
 
         if (!fetchedIcon) {
           failedCount += 1;
@@ -591,7 +623,7 @@ export default function SettingsDashboard() {
           icon: fetchedIcon,
           isCustomIcon: false,
         };
-      })
+      }
     );
 
     if (successCount === 0) {
@@ -1906,16 +1938,14 @@ export default function SettingsDashboard() {
             />
             <button
               type="submit"
-              disabled={faviconLoading || isSubmittingBookmarkForm}
+              disabled={isSubmittingBookmarkForm}
               className="rounded-lg bg-cyan-500 px-3 py-2 text-sm font-medium text-slate-900 transition hover:bg-cyan-400 disabled:opacity-70"
             >
-              {faviconLoading
-                ? '抓取图标中...'
-                : isSubmittingBookmarkForm
-                  ? '提交中...'
-                  : bookmarkForm.id
-                    ? '更新书签'
-                    : '新增书签'}
+              {isSubmittingBookmarkForm
+                ? '提交中...'
+                : bookmarkForm.id
+                  ? '更新书签'
+                  : '新增书签'}
             </button>
           </form>
 

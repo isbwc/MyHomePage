@@ -22,6 +22,7 @@ import {
   getVisitCount,
   saveHomepageConfig,
   fetchBookmarkFavicon,
+  mapWithConcurrency,
   verifyUnlockPassword,
 } from '@/lib/utils';
 import { isSettingsUnlocked, saveSettingsUnlock, clearSettingsUnlock } from '@/lib/unlock-state';
@@ -212,7 +213,6 @@ export default function HomepageDashboard() {
   });
   const [editError, setEditError] = useState<string | null>(null);
   const [isSavingEdit, setIsSavingEdit] = useState(false);
-  const [isFetchingEditIcon, setIsFetchingEditIcon] = useState(false);
   const [draggingBookmarkId, setDraggingBookmarkId] = useState<string | null>(null);
   const draggingBookmarkIdRef = useRef<string | null>(null);
   const configRef = useRef(config);
@@ -464,12 +464,27 @@ export default function HomepageDashboard() {
 
     autoFaviconRefreshRunningRef.current = true;
 
-    void (async () => {
+    // 取消标记：组件卸载或依赖变更时中止分批任务。
+    let cancelled = false;
+    let taskStarted = false;
+
+    const runRefresh = async () => {
+      taskStarted = true;
       const currentConfig = configRef.current;
       try {
-        const refreshedBookmarks = await Promise.all(
-          currentConfig.bookmarks.map(async (bookmark) => {
-            if (isCustomIconBookmark(bookmark)) {
+        // 分批并发（每批 4 个）：避免占满浏览器同域连接，
+        // 阻塞页面首屏的新闻、统计、地理等请求。
+        // 已有图标（含本地缓存命中）的书签直接跳过，不重新拉取；
+        // 只有无图标的书签才尝试获取。
+        const refreshedBookmarks = await mapWithConcurrency(
+          currentConfig.bookmarks,
+          4,
+          async (bookmark) => {
+            if (cancelled) {
+              return bookmark;
+            }
+
+            if (isCustomIconBookmark(bookmark) || bookmark.icon) {
               return bookmark;
             }
 
@@ -483,7 +498,7 @@ export default function HomepageDashboard() {
               icon: fetchedIcon,
               isCustomIcon: false,
             };
-          })
+          }
         );
 
         const nextConfig: HomepageConfig = {
@@ -516,7 +531,22 @@ export default function HomepageDashboard() {
       } finally {
         autoFaviconRefreshRunningRef.current = false;
       }
-    })();
+    };
+
+    // 延迟到页面加载完成后 5s 再启动，避免抢占首屏网络资源。
+    const delayTimer = window.setTimeout(() => {
+      void runRefresh();
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(delayTimer);
+      // 任务尚未启动（仍处于延迟期）时，必须释放运行锁，
+      // 否则后续依赖变化触发的刷新会被永久跳过。
+      if (!taskStarted) {
+        autoFaviconRefreshRunningRef.current = false;
+      }
+    };
   }, [
     config.faviconAutoRefreshEnabled,
     config.faviconAutoRefreshMinutes,
@@ -685,18 +715,9 @@ export default function HomepageDashboard() {
 
     let finalIcon = iconInput;
     let finalIsCustomIcon = iconInput ? editForm.isCustomIcon : false;
-
-    if (!finalIcon) {
-      setIsFetchingEditIcon(true);
-      const fetchedIcon = await fetchBookmarkFavicon(normalizedUrl);
-      setIsFetchingEditIcon(false);
-
-      if (fetchedIcon) {
-        finalIcon = fetchedIcon;
-      }
-
-      finalIsCustomIcon = false;
-    }
+    // 无自定义图标时先保存（首字母兜底），图标改为后台异步补充，
+    // 避免等待 favicon 抓取（慢站点可能数秒）阻塞保存流程。
+    const needsAutoIcon = !finalIcon;
 
     try {
       const nextConfig: HomepageConfig = {
@@ -725,6 +746,47 @@ export default function HomepageDashboard() {
         icon: '',
         isCustomIcon: false,
       });
+
+      if (needsAutoIcon) {
+        void (async () => {
+          const fetchedIcon = await fetchBookmarkFavicon(normalizedUrl);
+          if (!fetchedIcon) {
+            return;
+          }
+
+          try {
+            const latestConfig = configRef.current;
+            const stillExists = latestConfig.bookmarks.some(
+              (bookmark) => bookmark.id === editForm.id
+            );
+
+            if (!stillExists) {
+              return;
+            }
+
+            const withIconConfig: HomepageConfig = {
+              ...latestConfig,
+              bookmarks: latestConfig.bookmarks.map((bookmark) =>
+                bookmark.id === editForm.id
+                  ? {
+                      ...bookmark,
+                      icon: fetchedIcon,
+                      isCustomIcon: false,
+                    }
+                  : bookmark
+              ),
+              updatedAt: new Date().toISOString(),
+            };
+
+            const iconSaved = await saveHomepageConfig(withIconConfig);
+            if (iconSaved.bookmarks.some((bookmark) => bookmark.id === editForm.id)) {
+              setConfig(iconSaved);
+            }
+          } catch {
+            // 图标同步失败时保留首字母兜底，不阻断保存。
+          }
+        })();
+      }
     } catch (error) {
       setEditError(error instanceof Error ? error.message : '保存失败');
     } finally {
@@ -1444,7 +1506,7 @@ export default function HomepageDashboard() {
                     className="inline-flex items-center gap-2 rounded-lg bg-cyan-500 px-3 py-2 text-sm font-medium text-slate-900 transition hover:bg-cyan-400 disabled:opacity-70"
                   >
                     {isSavingEdit ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                    {isFetchingEditIcon ? '抓取图标中...' : isSavingEdit ? '保存中...' : '保存修改'}
+                    {isSavingEdit ? '保存中...' : '保存修改'}
                   </button>
                 </div>
               </form>

@@ -4,14 +4,27 @@
 // 抓取策略（按优先级依次尝试）：
 //   1. 解析目标站点 HTML 的 <link rel="icon|shortcut icon|apple-touch-icon"> 指向的图标
 //   2. 解析 <link rel="manifest"> 中 PWA 声明的图标
-//   3. /favicon.ico 根路径图标
-//   4. 第三方图标服务（icon.horse、DuckDuckGo、Google）作为兜底
+//   3. /favicon.ico 根路径 + 第三方图标服务（icon.horse、DuckDuckGo、Google）并行兜底
 //
-// 这样可以兼容只通过 <link rel="icon" href="/favicon.svg"> 引用图标的站点
-//（如 Next.js 站点），以及使用 PNG/ICO/SVG 等各种图标格式的站点。
-// 同时处理 HTML 实体编码的 href（如 Next.js 输出的 data: SVG 图标）。
+// 性能设计：
+//   - 分级超时（HTML 6s、图标 6s、兜底 5s），单次请求最坏 ≈ 12s
+//   - 兜底源并行竞速，整体耗时 = 单个兜底源超时，而非串行累加
+//   - 成功响应附带 CDN 缓存头，重复请求（定时刷新）可命中缓存
+//
+// 兼容性：
+//   - 支持只通过 <link rel="icon" href="/favicon.svg"> 引用图标的站点
+//     （如 Next.js 站点），以及 PNG/ICO/SVG 等各种图标格式
+//   - 处理 HTML 实体编码的 href（如 Next.js 输出的 data: SVG 图标）
 
-const FETCH_TIMEOUT_MS = 8 * 1000;
+// 分级超时：HTML 抓取与常规图标下载各 6s，兜底源（根路径 + 第三方）5s。
+// 所有阶段均为并行或单阶段超时，单次请求最坏耗时 ≈ 12s（HTML 6s + 兜底 6s）。
+const HTML_TIMEOUT_MS = 6 * 1000;
+const ICON_TIMEOUT_MS = 6 * 1000;
+const FALLBACK_TIMEOUT_MS = 5 * 1000;
+
+// 成功响应附带 CDN 缓存头，同 URL 重复请求（如定时刷新图标）可命中缓存，
+// 避免每次打开页面都重新抓取目标站点。
+const CACHE_HEADERS = { 'cache-control': 'public, max-age=86400' };
 
 // 常见 HTML 实体解码表。
 const HTML_ENTITY_MAP = {
@@ -60,10 +73,13 @@ function getHeaders() {
   };
 }
 
-function jsonResponse(data, status = 200) {
+function jsonResponse(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: getHeaders(),
+    headers: {
+      ...getHeaders(),
+      ...extraHeaders,
+    },
   });
 }
 
@@ -157,9 +173,9 @@ function looksLikeImage(bytes, contentType) {
   return false;
 }
 
-async function fetchWithTimeout(url, options = {}) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = ICON_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, { ...options, signal: controller.signal });
   } finally {
@@ -167,18 +183,22 @@ async function fetchWithTimeout(url, options = {}) {
   }
 }
 
-async function tryFetchIcon(url) {
+async function tryFetchIcon(url, timeoutMs = ICON_TIMEOUT_MS) {
   try {
-    const resp = await fetchWithTimeout(url, {
-      method: 'GET',
-      headers: {
-        accept: 'image/*,*/*;q=0.8',
-        // 部分站点对无 UA 请求返回 403，伪装常见浏览器 UA 提升兼容性。
-        'user-agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    const resp = await fetchWithTimeout(
+      url,
+      {
+        method: 'GET',
+        headers: {
+          accept: 'image/*,*/*;q=0.8',
+          // 部分站点对无 UA 请求返回 403，伪装常见浏览器 UA 提升兼容性。
+          'user-agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        },
+        redirect: 'follow',
       },
-      redirect: 'follow',
-    });
+      timeoutMs
+    );
 
     if (!resp.ok) {
       return null;
@@ -339,15 +359,19 @@ function parseIconSize(sizes) {
 // 返回 { iconLinks: [], manifestUrl: string|null }。
 async function fetchSiteHtmlInfo(targetUrl) {
   try {
-    const resp = await fetchWithTimeout(targetUrl, {
-      method: 'GET',
-      headers: {
-        accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
-        'user-agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    const resp = await fetchWithTimeout(
+      targetUrl,
+      {
+        method: 'GET',
+        headers: {
+          accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+          'user-agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        },
+        redirect: 'follow',
       },
-      redirect: 'follow',
-    });
+      HTML_TIMEOUT_MS
+    );
 
     if (!resp.ok) {
       return { iconLinks: [], manifestUrl: null };
@@ -383,15 +407,19 @@ function buildThirdPartySources(hostname) {
 // 抓取 PWA manifest 并返回其中按尺寸降序排列的图标候选。
 async function fetchIconsFromManifest(manifestUrl) {
   try {
-    const resp = await fetchWithTimeout(manifestUrl, {
-      method: 'GET',
-      headers: {
-        accept: 'application/manifest+json,application/json,*/*;q=0.8',
-        'user-agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    const resp = await fetchWithTimeout(
+      manifestUrl,
+      {
+        method: 'GET',
+        headers: {
+          accept: 'application/manifest+json,application/json,*/*;q=0.8',
+          'user-agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        },
+        redirect: 'follow',
       },
-      redirect: 'follow',
-    });
+      ICON_TIMEOUT_MS
+    );
 
     if (!resp.ok) return [];
 
@@ -401,6 +429,30 @@ async function fetchIconsFromManifest(manifestUrl) {
     console.error('Fetch manifest failed:', manifestUrl, err);
     return [];
   }
+}
+
+// 并行竞速：返回第一个成功的图标 data URL；
+// 全部失败（或全部返回 null）时返回 null。
+// 整体耗时 = 第一个成功源的耗时；全失败时 = 最慢源 settle 的耗时。
+// 避免某个慢源（如 /favicon.ico 挂起至超时）拖累整体。
+async function raceFirstSuccess(fetchers) {
+  let settled = 0;
+
+  return new Promise((resolve) => {
+    for (const fetcher of fetchers) {
+      fetcher.then((value) => {
+        if (value) {
+          resolve(value);
+          return;
+        }
+
+        settled += 1;
+        if (settled === fetchers.length) {
+          resolve(null);
+        }
+      });
+    }
+  });
 }
 
 export async function onRequestOptions() {
@@ -433,12 +485,20 @@ export async function onRequestGet({ request }) {
 
     for (const link of iconLinks) {
       if (link.isDataUrl) {
-        return jsonResponse({ iconDataUrl: link.url, source: 'html-data-url' });
+        return jsonResponse(
+          { iconDataUrl: link.url, source: 'html-data-url' },
+          200,
+          CACHE_HEADERS
+        );
       }
 
       const iconDataUrl = await tryFetchIcon(link.url);
       if (iconDataUrl) {
-        return jsonResponse({ iconDataUrl, source: 'html-link' });
+        return jsonResponse(
+          { iconDataUrl, source: 'html-link' },
+          200,
+          CACHE_HEADERS
+        );
       }
     }
 
@@ -447,29 +507,41 @@ export async function onRequestGet({ request }) {
       const manifestIcons = await fetchIconsFromManifest(manifestUrl);
       for (const icon of manifestIcons) {
         if (icon.isDataUrl) {
-          return jsonResponse({ iconDataUrl: icon.url, source: 'manifest-data-url' });
+          return jsonResponse(
+            { iconDataUrl: icon.url, source: 'manifest-data-url' },
+            200,
+            CACHE_HEADERS
+          );
         }
 
         const iconDataUrl = await tryFetchIcon(icon.url);
         if (iconDataUrl) {
-          return jsonResponse({ iconDataUrl, source: 'manifest' });
+          return jsonResponse(
+            { iconDataUrl, source: 'manifest' },
+            200,
+            CACHE_HEADERS
+          );
         }
       }
     }
 
-    // 策略 3：尝试 /favicon.ico 根路径。
-    const rootFavicon = `${parsed.protocol}//${hostname}/favicon.ico`;
-    const rootIcon = await tryFetchIcon(rootFavicon);
-    if (rootIcon) {
-      return jsonResponse({ iconDataUrl: rootIcon, source: 'root-favicon' });
-    }
+    // 策略 3：/favicon.ico 根路径 + 第三方图标服务并行兜底。
+    // 竞速语义：第一个成功源立即返回，整体耗时 = 最快成功源耗时。
+    const fallbackSources = [
+      `${parsed.protocol}//${hostname}/favicon.ico`,
+      ...buildThirdPartySources(hostname),
+    ];
 
-    // 策略 4：第三方图标服务兜底。
-    for (const source of buildThirdPartySources(hostname)) {
-      const iconDataUrl = await tryFetchIcon(source);
-      if (iconDataUrl) {
-        return jsonResponse({ iconDataUrl, source: 'third-party' });
-      }
+    const fallbackIcon = await raceFirstSuccess(
+      fallbackSources.map((source) => tryFetchIcon(source, FALLBACK_TIMEOUT_MS))
+    );
+
+    if (fallbackIcon) {
+      return jsonResponse(
+        { iconDataUrl: fallbackIcon, source: 'fallback' },
+        200,
+        CACHE_HEADERS
+      );
     }
 
     return jsonResponse({ error: 'Failed to download icon' }, 404);

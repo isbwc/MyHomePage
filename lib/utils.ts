@@ -10,6 +10,30 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+// 以固定并发数批量执行异步任务。
+// 用于书签图标刷新等场景：避免全量并发占满浏览器同域连接，
+// 阻塞页面其他请求（新闻、统计、地理等）。
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+
+  const worker = async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index]);
+    }
+  };
+
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
 export function getFunctionsHost() {
   if (process.env.NODE_ENV === 'development') {
     return process.env.NEXT_PUBLIC_FUNCTIONS_HOST?.trim() || 'http://localhost:8088';
@@ -467,21 +491,106 @@ export async function uploadBackgroundImage(
   };
 }
 
-export async function fetchBookmarkFavicon(url: string): Promise<string | null> {
-  if (!url.trim()) {
+const FAVICON_CACHE_PREFIX = 'favicon-cache:';
+// 成功图标永久保存：拉取过一次就保存在本地，之后打开页面/自动刷新直接复用，
+// 不再重新拉取。需要重新拉取时通过手动"刷新图标"（force）绕过缓存。
+const FAVICON_CACHE_TTL_MS = Number.MAX_SAFE_INTEGER;
+// 确认无图标的站点缓存 24h，避免每次打开页面都重新触发慢请求链。
+const FAVICON_FAIL_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+type FaviconCacheEntry = {
+  /** 图标 data URL；空字符串表示该站点确认无图标 */
+  value: string;
+  savedAt: number;
+};
+
+type FaviconCacheResult = { hit: true; icon: string | null } | { hit: false };
+
+// 读取书签图标缓存：
+// - 命中且未过期：返回 { hit: true, icon }（icon 可能为 null，表示缓存了"无图标"）
+// - 未命中：返回 { hit: false }
+function readFaviconCache(url: string): FaviconCacheResult {
+  if (typeof localStorage === 'undefined') {
+    return { hit: false };
+  }
+
+  try {
+    const raw = localStorage.getItem(`${FAVICON_CACHE_PREFIX}${url}`);
+    if (!raw) {
+      return { hit: false };
+    }
+
+    const entry = JSON.parse(raw) as FaviconCacheEntry;
+    if (!entry || typeof entry.value !== 'string' || typeof entry.savedAt !== 'number') {
+      return { hit: false };
+    }
+
+    const ttl = entry.value ? FAVICON_CACHE_TTL_MS : FAVICON_FAIL_CACHE_TTL_MS;
+    if (Date.now() - entry.savedAt > ttl) {
+      return { hit: false };
+    }
+
+    return { hit: true, icon: entry.value || null };
+  } catch {
+    return { hit: false };
+  }
+}
+
+function writeFaviconCache(url: string, icon: string | null) {
+  if (typeof localStorage === 'undefined') {
+    return;
+  }
+
+  try {
+    const entry: FaviconCacheEntry = {
+      value: icon || '',
+      savedAt: Date.now(),
+    };
+    localStorage.setItem(`${FAVICON_CACHE_PREFIX}${url}`, JSON.stringify(entry));
+  } catch {
+    // 存储不可用（隐私模式/配额）时静默降级为不缓存。
+  }
+}
+
+// 获取书签图标。
+// 结果按 URL 缓存在 localStorage：
+//   - 成功图标永久保存，重复调用（自动刷新/批量刷新/补图标）直接命中本地，不发网络请求
+//   - 确认无图标的站点缓存 24h，避免每次打开页面都触发慢请求链
+// 传入 { force: true } 可绕过缓存强制重新拉取（手动"刷新图标"按钮）。
+export async function fetchBookmarkFavicon(
+  url: string,
+  options?: { force?: boolean }
+): Promise<string | null> {
+  const normalized = url.trim();
+  if (!normalized) {
     return null;
+  }
+
+  if (!options?.force) {
+    const cached = readFaviconCache(normalized);
+    if (cached.hit) {
+      return cached.icon;
+    }
   }
 
   try {
     const data = await requestJson<{ iconDataUrl?: string }>(
-      `/favicon-fetch?url=${encodeURIComponent(url)}`,
+      `/favicon-fetch?url=${encodeURIComponent(normalized)}`,
       {
         method: 'GET',
       }
     );
 
-    return data.iconDataUrl || null;
-  } catch {
+    const icon = data.iconDataUrl || null;
+    writeFaviconCache(normalized, icon);
+    return icon;
+  } catch (error) {
+    // 仅当函数明确返回"站点无图标"时缓存失败标记，
+    // 网络超时/接口故障不缓存，避免屏蔽后续重试。
+    const message = error instanceof Error ? error.message : '';
+    if (message.includes('Failed to download icon')) {
+      writeFaviconCache(normalized, null);
+    }
     return null;
   }
 }
